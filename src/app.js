@@ -1,3 +1,4 @@
+/* eslint-disable no-await-in-loop */
 const url = require('url');
 const log4js = require('log4js');
 const recording = require('log4js/lib/appenders/recording');
@@ -9,10 +10,6 @@ log4js.configure({
     },
     out: {
       type: 'console',
-      layout: {
-        type: 'pattern',
-        pattern: '%d %p %c %X{user} %m%n',
-      },
     },
   },
   categories: { default: { appenders: ['vcr', 'out'], level: 'info' } },
@@ -25,6 +22,8 @@ const superagent = require('superagent');
 const config = require('../config');
 const accounts = require('../accounts');
 const serverChan = require('../serverChan');
+const telegramBot = require('../telegramBot');
+const wecomBot = require('../wecomBot');
 
 const client = superagent.agent();
 const headers = {
@@ -178,12 +177,16 @@ const doGet = (taskUrl) => new Promise((resolve, reject) => {
 const mask = (s, start, end) => s.split('').fill('*', start, end).join('');
 
 // 登录流程 1.获取公钥 -> 2.获取登录参数 -> 3.获取登录地址,跳转到登录页
-const doLogin = async (userName, password) => {
-  const encryptKey = await getEncrypt();
-  const formData = await getLoginFormData(userName, password, encryptKey);
-  const loginResult = await login(formData);
-  return [encryptKey, formData, loginResult];
-};
+const doLogin = (userName, password) => new Promise((resolve, reject) => {
+  getEncrypt()
+    .then((encryptKey) => getLoginFormData(userName, password, encryptKey))
+    .then((formData) => login(formData))
+    .then(() => resolve('登录成功'))
+    .catch((error) => {
+      logger.error(`登录失败:${JSON.stringify(error)}`);
+      reject(error);
+    });
+});
 
 // 任务 1.签到 2.天天抽红包 3.自动备份抽红包
 const doTask = async () => {
@@ -191,12 +194,12 @@ const doTask = async () => {
     `https://cloud.189.cn/mkt/userSign.action?rand=${new Date().getTime()}&clientType=TELEANDROID&version=${config.version}&model=${config.model}`,
     'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_SIGNIN&activityId=ACT_SIGNIN',
     'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_SIGNIN_PHOTOS&activityId=ACT_SIGNIN',
+    'https://m.cloud.189.cn/v2/drawPrizeMarketDetails.action?taskId=TASK_2022_FLDFS_KJ&activityId=ACT_SIGNIN',
   ];
 
   const result = [];
   for (let index = 0; index < tasks.length; index += 1) {
     const task = tasks[index];
-    // eslint-disable-next-line no-await-in-loop
     const res = await doGet(task);
     if (index === 0) {
       // 签到
@@ -221,17 +224,71 @@ const pushServerChan = (title, desp) => {
     .send(data)
     .end((err, res) => {
       if (err) {
-        logger.error(`推送失败:${JSON.stringify(err)}`);
+        logger.error(`ServerChan推送失败:${JSON.stringify(err)}`);
         return;
       }
       const json = JSON.parse(res.text);
       if (json.code !== 0) {
-        logger.error(`推送失败:${JSON.stringify(json)}`);
+        logger.error(`ServerChan推送失败:${JSON.stringify(json)}`);
       } else {
-        logger.info('推送成功');
+        logger.info('ServerChan推送成功');
       }
     });
 };
+
+const pushTelegramBot = (title, desp) => {
+  if (!(telegramBot.botToken && telegramBot.chatId)) { return; }
+  const data = {
+    chat_id: telegramBot.chatId,
+    text: title + "\n\n" + desp,
+  };
+  superagent.post(`https://api.telegram.org/bot${telegramBot.botToken}/sendMessage`)
+    .type('form')
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (!json.ok) {
+        logger.error(`TelegramBot推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('TelegramBot推送成功');
+      }
+    });
+};
+
+const pushWecomBot = (title, desp) => {
+  if (!(wecomBot.key && wecomBot.telphone)) { return; }
+  const data = {
+    msgtype: "text",
+    text: {
+      content: title + "\n\n" + desp,
+      mentioned_mobile_list: [wecomBot.telphone]
+    }
+  };
+  superagent.post(`https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${wecomBot.key}`)
+    .send(data)
+    .end((err, res) => {
+      if (err) {
+        logger.error(`wecomBot推送失败:${JSON.stringify(err)}`);
+        return;
+      }
+      const json = JSON.parse(res.text);
+      if (json.errcode) {
+        logger.error(`wecomBot推送失败:${JSON.stringify(json)}`);
+      } else {
+        logger.info('wecomBot推送成功');
+      }
+    });
+};
+
+const push = (title, desp) => {
+  pushServerChan(title, desp);
+  pushTelegramBot(title, desp);
+  pushWecomBot(title, desp);
+}
 
 // 开始执行程序
 async function main() {
@@ -240,28 +297,30 @@ async function main() {
     const { userName, password } = account;
     if (userName && password) {
       const userNameInfo = mask(userName, 3, 7);
-      logger.addContext('user', userNameInfo);
-      // eslint-disable-next-line no-await-in-loop
-      await doLogin(userName, password).then(() => {
-        logger.log('登录成功开始执行任务');
-        return doTask().then((result) => {
-          result.forEach((r) => logger.log(r));
-          logger.log('任务执行完毕');
-        }).catch((e) => {
-          logger.error(`任务执行失败:${JSON.stringify(e)}`);
-        });
-      }).catch((e) => {
-        logger.error(`登录失败:${JSON.stringify(e)}`);
-      }).finally(() => {
-        logger.removeContext('user');
-      });
+      try {
+        logger.log(`账户 ${userNameInfo}开始执行`);
+        await doLogin(userName, password);
+        const result = await doTask();
+        result.forEach((r) => logger.log(r));
+        logger.log('任务执行完毕');
+      } catch (e) {
+        if (e.code === 'ECONNRESET') {
+          throw e;
+        }
+      } finally {
+        logger.log(`账户 ${userNameInfo}执行完毕`);
+      }
     }
   }
 }
 
-main().finally(() => {
-  const events = recording.replay();
-  const content = events.map((e) => `${e.context.user} ${e.data.join('')}`).join('  \n');
-  pushServerChan('天翼云盘自动签到任务', content);
-  recording.erase();
-});
+(async () => {
+  try {
+    await main();
+  } finally {
+    const events = recording.replay();
+    const content = events.map((e) => `${e.data.join('')}`).join('  \n');
+    push('天翼云盘自动签到任务', content);
+    recording.erase();
+  }
+})();
